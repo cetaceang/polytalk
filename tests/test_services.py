@@ -987,6 +987,63 @@ class TestTranslationPipelineService:
                     )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("transcript", "is_partial"),
+        [
+            ("Hello world.", False),
+            ("Buffered subtitle", True),
+        ],
+    )
+    async def test_process_streaming_disabled_tts_emits_subtitles_only(
+        self, transcript, is_partial
+    ):
+        """Disabled TTS skips synthesis for immediate and buffered translations."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+        pipeline.tts.enabled = False
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+            yield b"__END_SIGNAL__"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text=transcript,
+                language="en",
+                is_partial=is_partial,
+                metrics={},
+            )
+
+        mock_stream = MagicMock(return_value=mock_stream_transcribe())
+        mock_translate = AsyncMock(
+            return_value=MagicMock(
+                success=True,
+                text="Bonjour le monde.",
+                language="fr",
+            )
+        )
+        mock_synthesize = AsyncMock()
+
+        with patch.object(pipeline.whisper, "stream_transcribe", mock_stream):
+            with patch.object(pipeline.translation, "translate", mock_translate):
+                with patch.object(pipeline.tts, "synthesize", mock_synthesize):
+                    results = [
+                        result
+                        async for result in pipeline.process_streaming(
+                            mock_audio_gen(), "en", "fr"
+                        )
+                    ]
+
+        assert [
+            result["translated_text"]
+            for result in results
+            if result.get("type") == "translation"
+        ] == ["Bonjour le monde."]
+        assert not [result for result in results if result.get("type") == "tts"]
+        assert not [result for result in results if result.get("type") == "error"]
+        mock_synthesize.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_process_streaming_translation_retry_on_failure(self):
         """Test translation retry logic when first attempt fails."""
         pipeline = TranslationPipelineService(warm_connections=False)
@@ -2164,6 +2221,74 @@ async def test_conversation_mode_uses_detected_language_for_direction():
         ("How are you", "en", "de"),
     ]
     assert tts.languages == ["en", "de"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_mode_disabled_tts_emits_subtitles_only():
+    """Conversation mode skips synthesis when TTS is disabled."""
+    from app.services.base import TranscriptionResult, TranslationResult
+
+    class FakeWhisper:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def stream_transcribe(
+            self,
+            audio_generator,
+            language=None,
+            emit_policy="live",
+            candidate_languages=None,
+            on_result=None,
+        ):
+            yield TranscriptionResult(text="Guten Morgen", language="de")
+
+    class FakeTranslation:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def translate(self, text, source_language, target_language, **kwargs):
+            return TranslationResult(text="Good morning", success=True)
+
+    class DisabledTTS:
+        enabled = False
+
+        def __init__(self):
+            self.calls = 0
+
+        async def close(self):
+            pass
+
+        async def synthesize(self, text, language, output_path=None):
+            self.calls += 1
+            raise AssertionError("Disabled TTS must not be called")
+
+    async def audio_generator():
+        yield b"pcm"
+        yield b"__END_SIGNAL__"
+
+    tts = DisabledTTS()
+    pipeline = TranslationPipelineService(
+        whisper_service=FakeWhisper(),
+        translation_service=FakeTranslation(),
+        tts_service=tts,
+        warm_connections=False,
+    )
+
+    results = [
+        item
+        async for item in pipeline.process_streaming(
+            audio_generator(), "de", "en", mode="conversation"
+        )
+    ]
+
+    turns = [item for item in results if item.get("type") == "conversation_turn"]
+    assert [turn["translated_text"] for turn in turns] == ["Good morning"]
+    assert not [item for item in results if item.get("type") in {"tts", "error"}]
+    assert tts.calls == 0
 
 
 @pytest.mark.asyncio

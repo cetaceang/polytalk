@@ -179,6 +179,10 @@ class TranslationPipelineService:
 
         return await self.tts.synthesize(text, language, output_path)
 
+    def _is_tts_enabled(self) -> bool:
+        """Return whether this pipeline should create synthesized speech."""
+        return parse_bool_config(getattr(self.tts, "enabled", True), True)
+
     async def _warm_connections(self) -> None:
         """
         Pre-warm connections to Whisper and Translation services.
@@ -322,6 +326,11 @@ class TranslationPipelineService:
         logger.info(
             f"Starting conversation pipeline: {source_language} <-> {target_language}"
         )
+        tts_enabled = self._is_tts_enabled()
+        if not tts_enabled:
+            logger.info(
+                "TTS is disabled; conversation pipeline will emit subtitles only"
+            )
         pause_event = pause_event or asyncio.Event()
         full_transcript = ""
         turn_id = 0
@@ -433,19 +442,20 @@ class TranslationPipelineService:
                     "translated_text": result.text,
                 }
 
-                tts_result = await self._synthesize(
-                    result.text, turn_target, save_media=False
-                )
-                if tts_result.success:
-                    yield {
-                        "type": "tts",
-                        "audio_url": tts_result.audio_url,
-                        "sequence": turn_id,
-                        "turn_id": turn_id,
-                        "language": turn_target,
-                    }
-                elif tts_result.error:
-                    yield {"type": "error", "error": tts_result.error}
+                if tts_enabled:
+                    tts_result = await self._synthesize(
+                        result.text, turn_target, save_media=False
+                    )
+                    if tts_result.success:
+                        yield {
+                            "type": "tts",
+                            "audio_url": tts_result.audio_url,
+                            "sequence": turn_id,
+                            "turn_id": turn_id,
+                            "language": turn_target,
+                        }
+                    elif tts_result.error:
+                        yield {"type": "error", "error": tts_result.error}
 
             yield {"type": "complete"}
         except (GeneratorExit, asyncio.CancelledError):
@@ -554,12 +564,13 @@ class TranslationPipelineService:
         translation_context_max_chars = max(
             0, translation_int_config("context_max_chars", 1200)
         )
+        tts_enabled = self._is_tts_enabled()
+        if not tts_enabled:
+            logger.info("TTS is disabled; streaming pipeline will emit subtitles only")
 
-        # Create queues (maxsize=100 for safety, but effectively unlimited)
+        # Create stage queues. The TTS queue does not exist in subtitle-only mode.
         trans_queue = asyncio.Queue(maxsize=100)  # ASR → Translation
-        tts_queue = asyncio.Queue(
-            maxsize=100
-        )  # Translation → TTS (increased to prevent backpressure)
+        tts_queue = asyncio.Queue(maxsize=100) if tts_enabled else None
         result_queue = asyncio.Queue(maxsize=100)
         stop_event = asyncio.Event()
         pause_event = pause_event or asyncio.Event()
@@ -583,6 +594,9 @@ class TranslationPipelineService:
             except (TypeError, ValueError):
                 return default
 
+        def tts_queue_size() -> int:
+            return tts_queue.qsize() if tts_queue is not None else 0
+
         # Worker tasks
         asr_task = None
         translation_task = None
@@ -596,6 +610,9 @@ class TranslationPipelineService:
 
         async def tts_worker():
             """TTS worker task - generates speech from translated sentences."""
+            if tts_queue is None:
+                return
+
             tts_seq = 0
             pending_items = 0
 
@@ -661,7 +678,7 @@ class TranslationPipelineService:
                                 "[PIPELINE_METRIC] TTS completed "
                                 f"seq={tts_seq} queue_wait={tts_queue_wait:.3f}s "
                                 f"duration={duration:.3f}s "
-                                f"tts_queue={tts_queue.qsize()} "
+                                f"tts_queue={tts_queue_size()} "
                                 f"result_queue={result_queue.qsize()}"
                             )
                         else:
@@ -823,7 +840,10 @@ class TranslationPipelineService:
                         f"chars={len(current_custom_instruction or '')}"
                     )
 
-            async def enqueue_tts(text: str, sequence: int) -> None:
+            async def enqueue_tts(text: str, sequence: int) -> bool:
+                if tts_queue is None:
+                    return False
+
                 await tts_queue.put(
                     TranslatedSentence(
                         text=text,
@@ -833,8 +853,9 @@ class TranslationPipelineService:
                 )
                 logger.debug(
                     "[PIPELINE_QUEUE] Translation->TTS enqueued "
-                    f"seq={sequence} tts_queue={tts_queue.qsize()}"
+                    f"seq={sequence} tts_queue={tts_queue_size()}"
                 )
+                return True
 
             async def flush_translation_buffer(reason: str) -> None:
                 nonlocal full_translation, translation_buffer
@@ -872,8 +893,8 @@ class TranslationPipelineService:
                                 "translated_text": full_translation,
                             }
                         )
-                        await enqueue_tts(result.text, translation_sequence)
-                        translation_sequence += 1
+                        if await enqueue_tts(result.text, translation_sequence):
+                            translation_sequence += 1
                     else:
                         logger.warning(
                             f"Failed to flush buffer ({reason}): {result.error}"
@@ -920,7 +941,8 @@ class TranslationPipelineService:
                             "Translation worker: ASR done, finishing translations"
                         )
                         await flush_translation_buffer("asr done")
-                        await tts_queue.put(None)
+                        if tts_queue is not None:
+                            await tts_queue.put(None)
                         break
 
                     if msg["type"] == "error":
@@ -941,7 +963,7 @@ class TranslationPipelineService:
                         "[PIPELINE_METRIC] Translation worker received "
                         f"asr_queue_wait={asr_translation_queue_wait:.3f}s "
                         f"trans_queue={trans_queue.qsize()} "
-                        f"tts_queue={tts_queue.qsize()} "
+                        f"tts_queue={tts_queue_size()} "
                         f"result_queue={result_queue.qsize()}"
                     )
                     current_text = trans_result.text.strip()
@@ -1125,8 +1147,8 @@ class TranslationPipelineService:
                             )
 
                             # Push to TTS queue immediately for parallel processing
-                            await enqueue_tts(result.text, translation_sequence)
-                            translation_sequence += 1
+                            if await enqueue_tts(result.text, translation_sequence):
+                                translation_sequence += 1
                         else:
                             logger.warning(
                                 f"Skipping TTS for failed translation: {text_to_send[:50]}..."
@@ -1153,7 +1175,7 @@ class TranslationPipelineService:
         # Start worker tasks
         asr_task = asyncio.create_task(asr_worker())
         translation_task = asyncio.create_task(translation_worker())
-        tts_task = asyncio.create_task(tts_worker())
+        tts_task = asyncio.create_task(tts_worker()) if tts_enabled else None
 
         try:
             # Consume results from worker tasks
@@ -1203,17 +1225,18 @@ class TranslationPipelineService:
             except asyncio.CancelledError:
                 pass
 
-            # Wait for TTS to drain queue (max 5 seconds)
-            try:
-                await asyncio.wait_for(tts_task, timeout=5.0)
-                logger.info("TTS worker drained queue successfully")
-            except asyncio.TimeoutError:
-                logger.warning("TTS worker timeout, cancelling")
-                tts_task.cancel()
+            # Wait for TTS to drain queue (max 5 seconds) when it is enabled.
+            if tts_task is not None:
                 try:
-                    await tts_task
-                except asyncio.CancelledError:
-                    pass
+                    await asyncio.wait_for(tts_task, timeout=5.0)
+                    logger.info("TTS worker drained queue successfully")
+                except asyncio.TimeoutError:
+                    logger.warning("TTS worker timeout, cancelling")
+                    tts_task.cancel()
+                    try:
+                        await tts_task
+                    except asyncio.CancelledError:
+                        pass
 
             raise
         except Exception as e:
@@ -1233,16 +1256,17 @@ class TranslationPipelineService:
             except asyncio.CancelledError:
                 pass
 
-            # Wait for TTS to drain queue (max 5 seconds)
-            try:
-                await asyncio.wait_for(tts_task, timeout=5.0)
-                logger.info("TTS worker drained queue successfully")
-            except asyncio.TimeoutError:
-                logger.warning("TTS worker timeout, cancelling")
-                tts_task.cancel()
+            # Wait for TTS to drain queue (max 5 seconds) when it is enabled.
+            if tts_task is not None:
                 try:
-                    await tts_task
-                except asyncio.CancelledError:
-                    pass
+                    await asyncio.wait_for(tts_task, timeout=5.0)
+                    logger.info("TTS worker drained queue successfully")
+                except asyncio.TimeoutError:
+                    logger.warning("TTS worker timeout, cancelling")
+                    tts_task.cancel()
+                    try:
+                        await tts_task
+                    except asyncio.CancelledError:
+                        pass
 
             yield {"type": "error", "error": str(e), "success": False}

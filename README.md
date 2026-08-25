@@ -182,6 +182,9 @@ The Docker Compose setup includes:
    Open http://localhost:9000 in your browser
 
 **Note**: Port 9000 is used for the PolyTalk app. The STT and TTS services run on the internal Docker network.
+All Compose services load their runtime settings directly from `.env`.
+The Web UI is published only on `127.0.0.1`, and persistent container data is
+stored through bind mounts under `./data` rather than Docker named volumes.
 
 ## Configuration
 
@@ -220,13 +223,17 @@ translation:
 #### TTS (Text-to-Speech)
 ```yaml
 tts:
-  enabled: true
+  enabled: true  # Set false for subtitle-only mode
   mock_mode: true  # Set false for real API calls
   provider: "piper"
   base_url: "${TTS_BASE_URL}"
   voice: "en_GB-jenny_dioco-medium"
   timeout_seconds: 10
 ```
+
+With `tts.enabled: false`, PolyTalk emits translated text normally but does not
+create a TTS queue, call a speech provider, generate audio files, or emit TTS
+errors. This applies to live microphone, shared-tab, and conversation modes.
 
 #### App
 ```yaml
@@ -317,6 +324,7 @@ The main latency knobs are:
 | `translation.context_max_chunks` | `4` | Maximum previous translation chunks kept in per-session context. |
 | `translation.context_max_chars` | `1200` | Maximum source plus translated characters kept in per-session context. |
 | `translation.context_payload_warn_chars` | `2000` | Log a warning when final system plus user prompt text exceeds this many characters. Set `0` to disable. |
+| `tts.enabled` | `true` | Set to `false` for subtitle-only mode; translation remains enabled and no TTS work is queued. |
 | `tts.timeout_seconds` | `10` | Maximum wait for TTS generation. |
 | `TTS_WORKERS` | `4` | Number of Piper Gunicorn workers. Keep `2-4` on small hosts; raise toward `min(8, CPU cores)` only after CPU and memory headroom are confirmed. |
 

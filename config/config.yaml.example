@@ -65,7 +65,7 @@ visual_context:
   max_image_chars: 1500000
 
 tts:
-  enabled: true
+  enabled: true  # Set false for subtitle-only mode (no TTS queue or synthesis)
   mock_mode: true
   provider: "piper"
   base_url: "${TTS_BASE_URL}"
